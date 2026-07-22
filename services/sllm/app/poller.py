@@ -4,6 +4,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import httpx
 
@@ -19,6 +20,10 @@ QUERY_WINDOW_SECONDS = float(os.environ.get("QUERY_WINDOW_SECONDS", "300"))
 
 ANALYZE_API_URL = os.environ.get("ANALYZE_API_URL", "http://localhost:8000/analyze")
 ANALYZE_TIMEOUT_SECONDS = float(os.environ.get("ANALYZE_TIMEOUT_SECONDS", "120"))
+
+# Lambda(Slack 알림) 엔드포인트. 없으면 알림 자체를 건너뜀 (기본값 없음)
+LAMBDA_NOTIFY_URL = os.environ.get("LAMBDA_NOTIFY_URL", "")
+LAMBDA_NOTIFY_TIMEOUT_SECONDS = float(os.environ.get("LAMBDA_NOTIFY_TIMEOUT_SECONDS", "3"))
 
 FILTER_KEYWORDS = ("error", "warning", "oomkilled", "crashloopbackoff")
 _KEYWORD_PATTERN = re.compile("|".join(FILTER_KEYWORDS), re.IGNORECASE)
@@ -180,6 +185,50 @@ def _to_log_text(entry: LogEntry) -> str:
     )
 
 
+def _matched_keyword(entry: LogEntry) -> str:
+    match = _KEYWORD_PATTERN.search(entry.message)
+    return match.group(0) if match else "unknown"
+
+
+async def _notify_error_detected(entry: LogEntry) -> None:
+    if not LAMBDA_NOTIFY_URL:
+        return
+
+    payload = {
+        "notification_type": "error_detected",
+        "cluster_name": entry.cluster_name,
+        "failure_keyword": _matched_keyword(entry),
+        "log_snippet": entry.message[:500],
+        "detected_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=LAMBDA_NOTIFY_TIMEOUT_SECONDS) as client:
+            resp = await client.post(LAMBDA_NOTIFY_URL, json=payload)
+            resp.raise_for_status()
+    except httpx.ConnectError as e:
+        logger.warning(
+            "Slack 알림(에러 감지) 연결 실패, 무시하고 계속 진행 (cluster=%s pod=%s): %s",
+            entry.cluster_name,
+            entry.pod,
+            e,
+        )
+    except httpx.TimeoutException as e:
+        logger.warning(
+            "Slack 알림(에러 감지) 응답 시간 초과, 무시하고 계속 진행 (cluster=%s pod=%s): %s",
+            entry.cluster_name,
+            entry.pod,
+            e,
+        )
+    except httpx.HTTPStatusError as e:
+        logger.warning(
+            "Slack 알림(에러 감지) 호출 실패(HTTP %s), 무시하고 계속 진행 (cluster=%s pod=%s): %s",
+            e.response.status_code,
+            entry.cluster_name,
+            entry.pod,
+            e,
+        )
+
+
 async def _send_to_analyze(entry: LogEntry) -> dict:
     async with httpx.AsyncClient(timeout=ANALYZE_TIMEOUT_SECONDS) as client:
         resp = await client.post(
@@ -213,6 +262,9 @@ async def poll_once() -> list[tuple[LogEntry, dict]]:
             entry.pod,
             entry.message[:120],
         )
+
+        await _notify_error_detected(entry)
+
         try:
             analyzed = await _send_to_analyze(entry)
         except httpx.ConnectError as e:

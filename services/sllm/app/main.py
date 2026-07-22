@@ -2,6 +2,8 @@ import json
 import logging
 import os
 import re
+import time
+from datetime import datetime, timezone
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -12,6 +14,13 @@ logger = logging.getLogger("uvicorn.error")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")
 OLLAMA_TIMEOUT_SECONDS = float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "120"))
+
+# Lambda(Slack 알림) 엔드포인트. 없으면 알림 자체를 건너뜀 (기본값 없음)
+LAMBDA_NOTIFY_URL = os.environ.get("LAMBDA_NOTIFY_URL", "")
+LAMBDA_NOTIFY_TIMEOUT_SECONDS = float(os.environ.get("LAMBDA_NOTIFY_TIMEOUT_SECONDS", "3"))
+
+# dr_action_needed 판단 기준 (팀 확정): LivenessProbeFailure/NetworkTimeout이면 DR 전환 필요
+_DR_ACTION_FAILURE_TYPES = {"LivenessProbeFailure", "NetworkTimeout"}
 
 FAILURE_TYPES = [
     "OOMKilled",
@@ -147,8 +156,37 @@ async def _call_ollama(prompt: str) -> AnalyzeResponse:
         )
 
 
+async def _notify_analysis_complete(
+    cluster_name: str, result: AnalyzeResponse, response_time_sec: float
+) -> None:
+    if not LAMBDA_NOTIFY_URL:
+        return
+
+    payload = {
+        "notification_type": "analysis_complete",
+        "cluster_name": cluster_name,
+        "failure_type": result.failure_type,
+        "dr_action_needed": result.failure_type in _DR_ACTION_FAILURE_TYPES,
+        "summary": result.root_cause,
+        "response_time_sec": round(response_time_sec, 2),
+        "analyzed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=LAMBDA_NOTIFY_TIMEOUT_SECONDS) as client:
+            resp = await client.post(LAMBDA_NOTIFY_URL, json=payload)
+            resp.raise_for_status()
+    except httpx.ConnectError as e:
+        logger.warning("Slack 알림(분석 완료) 연결 실패, 무시: %s", e)
+    except httpx.TimeoutException as e:
+        logger.warning("Slack 알림(분석 완료) 응답 시간 초과, 무시: %s", e)
+    except httpx.HTTPStatusError as e:
+        logger.warning("Slack 알림(분석 완료) 호출 실패(HTTP %s), 무시: %s", e.response.status_code, e)
+
+
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
+    start = time.monotonic()
+
     prompt = PROMPT_TEMPLATE.format(
         log_text=req.log_text,
         failure_types=", ".join(FAILURE_TYPES),
@@ -157,15 +195,16 @@ async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
     first = await _call_ollama(prompt)
 
     if not _has_bad_pattern(first):
-        return first
+        result = first
+    else:
+        logger.warning("응답 필드에 한자·코드성 패턴 감지, 재시도: %s", first.model_dump())
+        retry = await _call_ollama(prompt)
+        result = retry if not _has_bad_pattern(retry) else _build_degraded_response(first, retry)
 
-    logger.warning("응답 필드에 한자·코드성 패턴 감지, 재시도: %s", first.model_dump())
-    retry = await _call_ollama(prompt)
+    elapsed = time.monotonic() - start
+    await _notify_analysis_complete(req.cluster_name or "unknown", result, elapsed)
 
-    if not _has_bad_pattern(retry):
-        return retry
-
-    return _build_degraded_response(first, retry)
+    return result
 
 
 @app.get("/health")

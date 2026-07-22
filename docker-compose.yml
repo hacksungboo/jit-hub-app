@@ -153,6 +153,7 @@ services:
     environment:
       JITHUB_LOCATION: LOCAL-DEV
       OLLAMA_URL: http://host.docker.internal:11434/api/generate
+      LAMBDA_NOTIFY_URL: ""
     ports:
       - "8005:8005"
     extra_hosts:
@@ -169,6 +170,7 @@ services:
     environment:
       JITHUB_LOCATION: LOCAL-DEV
       ANALYZE_API_URL: http://sllm-service:8005/analyze
+      LAMBDA_NOTIFY_URL: ""
     depends_on:
       sllm-service:
         condition: service_started
