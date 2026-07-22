@@ -66,6 +66,7 @@ _fallback_count = 0
 
 class AnalyzeRequest(BaseModel):
     log_text: str
+    cluster_name: str | None = None
 
 
 class AnalyzeResponse(BaseModel):
